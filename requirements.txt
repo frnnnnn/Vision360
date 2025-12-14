@@ -1,0 +1,5 @@
+boto3
+botocore
+opencv-python
+python-dotenv
+websocket-client
