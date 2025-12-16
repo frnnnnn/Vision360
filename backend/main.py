@@ -175,6 +175,31 @@ def delete_events_bulk(request: BulkDeleteRequest):
     print(f"[DELETE-BULK] Result: {result}")
     return result
 
+class EventUpdate(BaseModel):
+    reviewed: Optional[bool] = None
+
+@app.patch("/events/{event_id}")
+def update_event(event_id: str, update: EventUpdate):
+    """Update an event's fields (e.g., mark as reviewed)."""
+    updates = update.dict(exclude_unset=True)
+    if not updates:
+        raise HTTPException(status_code=400, detail="No fields to update")
+    if aws_service.update_event(event_id, updates):
+        return {"status": "updated", "event_id": event_id, "updates": updates}
+    raise HTTPException(status_code=500, detail="Failed to update event")
+
+class BulkReviewRequest(BaseModel):
+    event_ids: List[str]
+
+@app.post("/events/review-bulk")
+def review_events_bulk(request: BulkReviewRequest):
+    """Mark multiple events as reviewed at once."""
+    reviewed_count = 0
+    for event_id in request.event_ids:
+        if aws_service.update_event(event_id, {"reviewed": True}):
+            reviewed_count += 1
+    return {"reviewed": reviewed_count, "total": len(request.event_ids)}
+
 @app.get("/scan-network")
 def scan_network():
     devices = scanner_service.scan_network()
@@ -184,37 +209,102 @@ def scan_network():
 
 class FaceRegister(BaseModel):
     name: str
-    image_base64: str  # Base64 encoded image
+    images_base64: List[str]  # List of Base64 encoded images
+
+class FaceAddImages(BaseModel):
+    images_base64: List[str]  # List of Base64 encoded images to add
 
 class FaceSearch(BaseModel):
     image_base64: str  # Base64 encoded image
 
 @app.get("/faces")
 def list_faces():
-    """List all registered faces."""
-    faces = aws_service.list_faces()
-    return faces
+    """List all registered persons."""
+    persons = aws_service.list_faces()
+    return persons
 
 @app.post("/faces")
 def register_face(face_data: FaceRegister):
-    """Register a new person's face."""
+    """Register a new person with one or more face images."""
     import base64
-    try:
-        image_bytes = base64.b64decode(face_data.image_base64)
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid base64 image")
     
-    result = aws_service.index_face(image_bytes, face_data.name)
-    if result.get("success"):
-        return result
-    raise HTTPException(status_code=400, detail=result.get("error", "Failed to register face"))
+    if not face_data.images_base64:
+        raise HTTPException(status_code=400, detail="At least one image is required")
+    
+    person_id = None
+    results = []
+    
+    for idx, img_b64 in enumerate(face_data.images_base64):
+        try:
+            image_bytes = base64.b64decode(img_b64)
+        except Exception:
+            results.append({"index": idx, "success": False, "error": "Invalid base64 image"})
+            continue
+        
+        result = aws_service.index_face(image_bytes, face_data.name, person_id)
+        if result.get("success"):
+            person_id = result.get("person_id")  # Use same person_id for subsequent images
+            results.append({"index": idx, "success": True, "face_id": result.get("face_id")})
+        else:
+            results.append({"index": idx, "success": False, "error": result.get("error")})
+    
+    successful = [r for r in results if r.get("success")]
+    if not successful:
+        raise HTTPException(status_code=400, detail="No faces could be registered")
+    
+    return {
+        "success": True,
+        "person_id": person_id,
+        "name": face_data.name,
+        "faces_registered": len(successful),
+        "results": results
+    }
+
+@app.post("/faces/{person_id}/images")
+def add_face_images(person_id: str, face_data: FaceAddImages):
+    """Add more images to an existing person."""
+    import base64
+    
+    # Check if person exists
+    person = aws_service._get_person_by_id(person_id)
+    if not person:
+        raise HTTPException(status_code=404, detail="Person not found")
+    
+    results = []
+    for idx, img_b64 in enumerate(face_data.images_base64):
+        try:
+            image_bytes = base64.b64decode(img_b64)
+        except Exception:
+            results.append({"index": idx, "success": False, "error": "Invalid base64 image"})
+            continue
+        
+        result = aws_service.index_face(image_bytes, person.get("name", ""), person_id)
+        if result.get("success"):
+            results.append({"index": idx, "success": True, "face_id": result.get("face_id")})
+        else:
+            results.append({"index": idx, "success": False, "error": result.get("error")})
+    
+    successful = [r for r in results if r.get("success")]
+    return {
+        "success": len(successful) > 0,
+        "person_id": person_id,
+        "faces_added": len(successful),
+        "results": results
+    }
 
 @app.delete("/faces/{face_id}")
 def delete_face(face_id: str):
-    """Delete a registered face."""
+    """Delete a single face image (keeps person if other images exist)."""
     if aws_service.delete_face(face_id):
         return {"status": "deleted", "face_id": face_id}
     raise HTTPException(status_code=500, detail="Failed to delete face")
+
+@app.delete("/persons/{person_id}")
+def delete_person(person_id: str):
+    """Delete a person and all their face images."""
+    if aws_service.delete_person(person_id):
+        return {"status": "deleted", "person_id": person_id}
+    raise HTTPException(status_code=500, detail="Failed to delete person")
 
 @app.post("/faces/search")
 def search_face(search_data: FaceSearch):

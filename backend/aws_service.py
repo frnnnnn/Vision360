@@ -48,13 +48,21 @@ class AWSService:
 
     # ==================== FACE RECOGNITION ====================
     
-    def index_face(self, image_bytes: bytes, person_name: str) -> dict:
-        """Add a face to the collection and store person metadata."""
+    def index_face(self, image_bytes: bytes, person_name: str, person_id: str = None) -> dict:
+        """Add a face to the collection and store person metadata.
+        
+        If person_id is provided, add the face to an existing person.
+        Otherwise, create a new person.
+        """
+        import uuid
+        
         if self.use_local:
-            import uuid
             face_id = str(uuid.uuid4())
-            self.local_faces[face_id] = {"face_id": face_id, "name": person_name}
-            return {"success": True, "face_id": face_id, "name": person_name}
+            pid = person_id or str(uuid.uuid4())
+            if pid not in self.local_faces:
+                self.local_faces[pid] = {"person_id": pid, "name": person_name, "face_ids": []}
+            self.local_faces[pid]["face_ids"].append(face_id)
+            return {"success": True, "face_id": face_id, "person_id": pid, "name": person_name}
         
         try:
             response = self.rekognition.index_faces(
@@ -69,16 +77,41 @@ class AWSService:
                 return {"success": False, "error": "No face detected in image"}
             
             face_id = response["FaceRecords"][0]["Face"]["FaceId"]
+            pid = person_id or str(uuid.uuid4())
             
-            # Store person metadata in DynamoDB
+            # Check if person already exists
+            existing = self._get_person_by_id(pid)
+            if existing:
+                # Add face_id to existing person's list
+                face_ids = existing.get("face_ids", [])
+                if isinstance(face_ids, str):
+                    face_ids = [face_ids]
+                face_ids.append(face_id)
+                self.ddb.update_item(
+                    Key={"event_id": f"PERSON#{pid}"},
+                    UpdateExpression="SET face_ids = :fids",
+                    ExpressionAttributeValues={":fids": face_ids}
+                )
+            else:
+                # Create new person entry
+                self.ddb.put_item(Item={
+                    "event_id": f"PERSON#{pid}",
+                    "timestamp": 0,
+                    "person_id": pid,
+                    "face_ids": [face_id],
+                    "name": person_name
+                })
+            
+            # Also store face-to-person mapping for quick lookups
             self.ddb.put_item(Item={
                 "event_id": f"FACE#{face_id}",
                 "timestamp": 0,
                 "face_id": face_id,
+                "person_id": pid,
                 "name": person_name
             })
             
-            return {"success": True, "face_id": face_id, "name": person_name}
+            return {"success": True, "face_id": face_id, "person_id": pid, "name": person_name}
         except Exception as e:
             print(f"Error indexing face: {e}")
             return {"success": False, "error": str(e)}
@@ -125,31 +158,51 @@ class AWSService:
     def _get_person_by_face_id(self, face_id: str) -> dict:
         """Get person metadata by face_id."""
         if self.use_local:
-            return self.local_faces.get(face_id, {})
+            for pid, person in self.local_faces.items():
+                if face_id in person.get("face_ids", []):
+                    return person
+            return {}
         try:
             response = self.ddb.get_item(Key={"event_id": f"FACE#{face_id}"})
             return response.get("Item", {})
         except Exception as e:
             print(f"Error getting person: {e}")
             return {}
+    
+    def _get_person_by_id(self, person_id: str) -> dict:
+        """Get person metadata by person_id."""
+        if self.use_local:
+            return self.local_faces.get(person_id, {})
+        try:
+            response = self.ddb.get_item(Key={"event_id": f"PERSON#{person_id}"})
+            return response.get("Item", {})
+        except Exception as e:
+            print(f"Error getting person by id: {e}")
+            return {}
 
     def list_faces(self) -> list:
-        """List all registered faces with person metadata."""
+        """List all registered persons with their face metadata."""
         if self.use_local:
             return list(self.local_faces.values())
         
         try:
             response = self.ddb.scan()
-            faces = [i for i in response.get("Items", []) if i["event_id"].startswith("FACE#")]
-            return faces
+            # Return PERSON entries (grouped faces) instead of individual FACE entries
+            persons = [i for i in response.get("Items", []) if i["event_id"].startswith("PERSON#")]
+            return persons
         except Exception as e:
             print(f"Error listing faces: {e}")
             return []
 
     def delete_face(self, face_id: str) -> bool:
-        """Delete a face from collection and metadata."""
+        """Delete a single face from collection (keeps person if other faces exist)."""
         if self.use_local:
-            self.local_faces.pop(face_id, None)
+            for pid, person in list(self.local_faces.items()):
+                if face_id in person.get("face_ids", []):
+                    person["face_ids"].remove(face_id)
+                    if not person["face_ids"]:
+                        del self.local_faces[pid]
+                    return True
             return True
         
         try:
@@ -158,11 +211,68 @@ class AWSService:
                 CollectionId=FACE_COLLECTION_ID,
                 FaceIds=[face_id]
             )
-            # Delete metadata from DynamoDB
+            
+            # Get person_id from face mapping
+            face_meta = self._get_person_by_face_id(face_id)
+            person_id = face_meta.get("person_id")
+            
+            # Delete face mapping
             self.ddb.delete_item(Key={"event_id": f"FACE#{face_id}"})
+            
+            # Update person's face_ids list
+            if person_id:
+                person = self._get_person_by_id(person_id)
+                if person:
+                    face_ids = person.get("face_ids", [])
+                    if isinstance(face_ids, str):
+                        face_ids = [face_ids]
+                    if face_id in face_ids:
+                        face_ids.remove(face_id)
+                    if face_ids:
+                        # Update with remaining faces
+                        self.ddb.update_item(
+                            Key={"event_id": f"PERSON#{person_id}"},
+                            UpdateExpression="SET face_ids = :fids",
+                            ExpressionAttributeValues={":fids": face_ids}
+                        )
+                    else:
+                        # No faces left, delete person
+                        self.ddb.delete_item(Key={"event_id": f"PERSON#{person_id}"})
             return True
         except Exception as e:
             print(f"Error deleting face: {e}")
+            return False
+    
+    def delete_person(self, person_id: str) -> bool:
+        """Delete a person and all their faces."""
+        if self.use_local:
+            self.local_faces.pop(person_id, None)
+            return True
+        
+        try:
+            person = self._get_person_by_id(person_id)
+            if not person:
+                return False
+            
+            face_ids = person.get("face_ids", [])
+            if isinstance(face_ids, str):
+                face_ids = [face_ids]
+            
+            # Delete all faces from Rekognition
+            if face_ids:
+                self.rekognition.delete_faces(
+                    CollectionId=FACE_COLLECTION_ID,
+                    FaceIds=face_ids
+                )
+                # Delete face mappings
+                for fid in face_ids:
+                    self.ddb.delete_item(Key={"event_id": f"FACE#{fid}"})
+            
+            # Delete person entry
+            self.ddb.delete_item(Key={"event_id": f"PERSON#{person_id}"})
+            return True
+        except Exception as e:
+            print(f"Error deleting person: {e}")
             return False
 
     # ==================== CAMERAS ====================
@@ -276,6 +386,47 @@ class AWSService:
             return True
         except Exception as e:
             print(f"Error deleting event: {e}")
+            return False
+
+    def update_event(self, event_id: str, updates: dict) -> bool:
+        """Update an event's fields (e.g., reviewed status)."""
+        if not updates:
+            return False
+            
+        if self.use_local:
+            for event in self.local_events:
+                if event.get("event_id") == event_id:
+                    event.update(updates)
+                    return True
+            return False
+        
+        try:
+            # Build UpdateExpression
+            expr = "SET "
+            vals = {}
+            names = {}
+            for k, v in updates.items():
+                if k in ["event_id", "timestamp"]: continue
+                key_placeholder = f"#{k}"
+                val_placeholder = f":{k}"
+                expr += f"{key_placeholder} = {val_placeholder}, "
+                vals[val_placeholder] = v
+                names[key_placeholder] = k
+            
+            if not vals:
+                return False
+                
+            expr = expr.rstrip(", ")
+            
+            self.ddb.update_item(
+                Key={"event_id": event_id},
+                UpdateExpression=expr,
+                ExpressionAttributeNames=names,
+                ExpressionAttributeValues=vals
+            )
+            return True
+        except Exception as e:
+            print(f"Error updating event: {e}")
             return False
 
     def delete_events(self, event_ids: list) -> dict:
